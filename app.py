@@ -7,6 +7,7 @@ Features:
 - Emoji product buttons (no prices)
 - Inventory Dashboard (top/bottom sellers, stock health)
 - Excel export & PDF quick report
+- Plotly optional: falls back to Matplotlib if not installed
 """
 
 import streamlit as st
@@ -25,7 +26,52 @@ except Exception:
 from datetime import datetime
 from io import BytesIO
 import matplotlib.pyplot as plt
-import plotly.express as px
+
+# ----------------------------------------------------
+# SAFE PLOTLY IMPORT (optional)
+# ----------------------------------------------------
+px_available = True
+try:
+    import plotly.express as px
+except Exception:
+    px_available = False
+
+# small helper to render line charts, using plotly if available else matplotlib
+def render_line_chart(df, x, y, title=None, use_container_width=True):
+    """
+    df: DataFrame
+    x, y: column names
+    """
+    if px_available:
+        fig = px.line(df, x=x, y=y, title=title)
+        st.plotly_chart(fig, use_container_width=use_container_width)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.plot(df[x], df[y], marker="o")
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
+        ax.grid(True)
+        st.pyplot(fig)
+        plt.close(fig)
+
+# helper to render bar charts
+def render_bar_chart(df, x, y, title=None, use_container_width=True):
+    if px_available:
+        fig = px.bar(df, x=x, y=y, title=title)
+        st.plotly_chart(fig, use_container_width=use_container_width)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.bar(df[x].astype(str), df[y])
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
+        ax.grid(True, axis='y')
+        plt.xticks(rotation=45, ha='right')
+        st.pyplot(fig)
+        plt.close(fig)
 
 # Page config
 st.set_page_config(page_title="📦 Smart Shopkeeper Assistant", layout="wide", page_icon="🛒")
@@ -226,18 +272,21 @@ if page == "Forecasting":
             st.warning("Prophet failed — using fallback forecast instead.")
             forecast_display = naive_forecast(prod_hist, int(forecast_days))
     else:
-        st.info("Prophet not available or insufficient data. Using fallback forecast.")
+        if not USE_PROPHET:
+            st.info("Prophet not available. Using fallback forecast.")
+        else:
+            st.info("Insufficient data for Prophet. Using fallback forecast.")
         forecast_display = naive_forecast(prod_hist, int(forecast_days))
 
     st.subheader(f"{forecast_days}-day Forecast")
     st.dataframe(forecast_display)
 
-    # Chart
+    # Chart (uses plotly if available, else matplotlib)
     combined = pd.concat([
         prod_hist.rename(columns={"Date": "Date", "Quantity": "Sales"})[["Date", "Sales"]],
         forecast_display.rename(columns={"Date": "Date", "Predicted Sales": "Sales"})[["Date", "Sales"]],
     ])
-    st.plotly_chart(px.line(combined, x="Date", y="Sales"), use_container_width=True)
+    render_line_chart(combined, x="Date", y="Sales", title=f"History + Forecast: {selected_product}")
 
     # Inventory suggestion
     avg_demand = float(forecast_display["Predicted Sales"].mean())
@@ -311,28 +360,76 @@ if page == "Inventory Dashboard":
     )
 
     summary = pd.merge(total_by_product, recent, on="Product", how="left").fillna(0)
-    summary["AvgDailyRecent"] = summary["Quantity_y"] / window_days
+    # unify column names for safety: recent sum may be named "Quantity_y" if merged; normalize below
+    if "Quantity_y" in summary.columns:
+        summary = summary.rename(columns={"Quantity_x": "TotalSold", "Quantity_y": "SoldRecent"})
+    else:
+        # make explicit TotalSold, SoldRecent
+        summary = summary.rename(columns={"Quantity": "TotalSold"})
+        if "SoldRecent" not in summary.columns:
+            # compute SoldRecent from 'recent' merge
+            recent_map = recent.set_index("Product")["Quantity"].to_dict()
+            summary["SoldRecent"] = summary["Product"].map(recent_map).fillna(0)
+
+    # ensure numeric columns
+    summary["SoldRecent"] = pd.to_numeric(summary["SoldRecent"], errors="coerce").fillna(0)
+    summary["AvgDailyRecent"] = summary["SoldRecent"] / (window_days if window_days > 0 else 1)
     summary["CurrentStock"] = summary["Product"].apply(lambda p: st.session_state.get(f"stock_{p}", 0))
     summary["ReorderPoint"] = summary["AvgDailyRecent"] * lead_time_days
 
-    def health(r):
+    def health_and_color(r):
         if r["CurrentStock"] <= 0:
             return "Critical", "#D7263D"
         if r["CurrentStock"] < r["ReorderPoint"]:
             return "Low", "#FF8C00"
         return "Healthy", "#2ECC71"
 
-    summary[["Health", "Color"]] = summary.apply(lambda r: pd.Series(health(r)), axis=1)
+    summary[["Health", "BadgeColor"]] = summary.apply(lambda r: pd.Series(health_and_color(r)), axis=1)
 
-    st.dataframe(summary)
+    st.subheader("Product Summary")
+    st.dataframe(summary.sort_values(["Health", "TotalSold"], ascending=[True, False]).reset_index(drop=True))
 
-    st.subheader("Low Stock")
-    low_items = summary[summary["Health"] != "Healthy"]
-    for _, r in low_items.iterrows():
-        st.markdown(
-            f"**{r['Product']}** — {colored_badge(r['Health'], r['Color'])}",
-            unsafe_allow_html=True
-        )
+    st.subheader("Low Stock / Critical Items")
+    low_items = summary[summary["Health"].isin(["Critical", "Low"])].sort_values("ReorderPoint")
+    if low_items.empty:
+        st.success("No low stock items.")
+    else:
+        for _, row in low_items.iterrows():
+            prod = row["Product"]
+            badge_html = colored_badge(row["Health"], row["BadgeColor"])
+            st.markdown(f"**{prod}** — Current: `{int(row['CurrentStock'])}` | Reorder: `{int(row['ReorderPoint'])}` | Status: {badge_html}", unsafe_allow_html=True)
+
+    st.subheader(f"Top movers (last {window_days} days)")
+    movers = summary.sort_values("SoldRecent", ascending=False).head(10)
+    if not movers.empty:
+        render_bar_chart(movers, x="Product", y="SoldRecent", title="Top movers (recent)")
+
+    st.subheader("Monthly Sales")
+    monthly = data.copy()
+    monthly["Month"] = monthly["Date"].dt.to_period("M").astype(str)
+    monthly_agg = monthly.groupby(["Month", "Product"])["Quantity"].sum().reset_index()
+    # plot grouped bar chart - prefer plotly; fallback to matplotlib stacked/grouped may be messy but attempt simple grouped
+    if px_available:
+        fig_month = px.bar(monthly_agg, x="Month", y="Quantity", color="Product", title="Monthly Sales", barmode="group")
+        st.plotly_chart(fig_month, use_container_width=True)
+    else:
+        # simple visualization: pivot for matplotlib
+        try:
+            pivot = monthly_agg.pivot(index="Month", columns="Product", values="Quantity").fillna(0)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            pivot.plot(kind="bar", ax=ax)
+            ax.set_title("Monthly Sales")
+            ax.set_xlabel("Month")
+            ax.set_ylabel("Quantity")
+            plt.xticks(rotation=45, ha='right')
+            st.pyplot(fig)
+            plt.close(fig)
+        except Exception:
+            st.write("Plotly not available and Matplotlib grouped bar failed to render.")
+
+    st.markdown("---")
+    excel_buf = excel_bytes_multi(data, summary)
+    st.download_button("📥 Download Inventory Excel", data=excel_buf, file_name=export_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ----------------------------
 # PAGE: Reports
