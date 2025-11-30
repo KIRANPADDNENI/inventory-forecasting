@@ -1,77 +1,39 @@
 # app.py
 """
-Smart Shopkeeper Assistant — Sidebar menu moved to top
+Smart Shopkeeper Assistant — with Gmail alerts (App Password)
 Features:
-- Prophet forecasting (trend-aware) IF installed
-- Automatic fallback forecast if Prophet is missing
-- Emoji product buttons (no prices)
-- Inventory Dashboard (top/bottom sellers, stock health)
-- Excel export & PDF quick report
-- Plotly optional: falls back to Matplotlib if not installed
+- Prophet forecasting (optional)
+- Fallback forecast if Prophet missing or insufficient data
+- Plotly optional (falls back to Matplotlib)
+- Gmail alerts using App Password (from st.secrets or sidebar)
+- No DB, no signup — session-state only
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ----------------------------------------------------
-# SAFE PROPHET IMPORT  (Fix for Streamlit Cloud error)
-# ----------------------------------------------------
+# -----------------------
+# Optional imports: Prophet, Plotly
+# -----------------------
 USE_PROPHET = True
 try:
     from prophet import Prophet
 except Exception:
     USE_PROPHET = False
 
-from datetime import datetime
-from io import BytesIO
-import matplotlib.pyplot as plt
-
-# ----------------------------------------------------
-# SAFE PLOTLY IMPORT (optional)
-# ----------------------------------------------------
 px_available = True
 try:
     import plotly.express as px
 except Exception:
     px_available = False
 
-# small helper to render line charts, using plotly if available else matplotlib
-def render_line_chart(df, x, y, title=None, use_container_width=True):
-    """
-    df: DataFrame
-    x, y: column names
-    """
-    if px_available:
-        fig = px.line(df, x=x, y=y, title=title)
-        st.plotly_chart(fig, use_container_width=use_container_width)
-    else:
-        fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.plot(df[x], df[y], marker="o")
-        if title:
-            ax.set_title(title)
-        ax.set_xlabel(x)
-        ax.set_ylabel(y)
-        ax.grid(True)
-        st.pyplot(fig)
-        plt.close(fig)
-
-# helper to render bar charts
-def render_bar_chart(df, x, y, title=None, use_container_width=True):
-    if px_available:
-        fig = px.bar(df, x=x, y=y, title=title)
-        st.plotly_chart(fig, use_container_width=use_container_width)
-    else:
-        fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.bar(df[x].astype(str), df[y])
-        if title:
-            ax.set_title(title)
-        ax.set_xlabel(x)
-        ax.set_ylabel(y)
-        ax.grid(True, axis='y')
-        plt.xticks(rotation=45, ha='right')
-        st.pyplot(fig)
-        plt.close(fig)
+from datetime import datetime
+from io import BytesIO
+import matplotlib.pyplot as plt
+import smtplib
+from email.message import EmailMessage
+import traceback
 
 # Page config
 st.set_page_config(page_title="📦 Smart Shopkeeper Assistant", layout="wide", page_icon="🛒")
@@ -95,21 +57,81 @@ if "forced_page" not in st.session_state:
     st.session_state.forced_page = None
 
 # ----------------------------
-# Sidebar MENU + settings
+# Sidebar MENU + settings + Gmail
 # ----------------------------
 sidebar_page = st.sidebar.selectbox("📌 Menu", ["Sales Entry", "Forecasting", "Inventory Dashboard", "Reports", "Help"])
 st.sidebar.markdown("---")
+
 st.sidebar.subheader("📈 Forecast Settings")
 forecast_days = st.sidebar.number_input("Forecast Horizon (days)", min_value=3, max_value=60, value=7)
 lead_time_days = st.sidebar.number_input("Lead Time (days)", min_value=1, max_value=14, value=3)
+
 st.sidebar.subheader("📤 Export")
 export_filename = st.sidebar.text_input("Export filename (Excel)", value="shop_report.xlsx")
+
+st.sidebar.subheader("🔔 Gmail Alerts")
+enable_email = st.sidebar.checkbox("Enable Gmail Alerts", value=False)
+
+# First priority: secrets (recommended). Fall back to entering in sidebar fields if secrets absent.
+secrets_gmail_id = st.secrets.get("gmail_id") if hasattr(st, "secrets") else None
+secrets_gmail_pass = st.secrets.get("gmail_pass") if hasattr(st, "secrets") else None
+secrets_alert_recipient = st.secrets.get("alert_recipient") if hasattr(st, "secrets") else None
+
+if enable_email:
+    # show fields but prefill with secrets if available (but do not expose secrets in logs)
+    gmail_id_input = st.sidebar.text_input("Gmail (sender)", value=secrets_gmail_id or "")
+    gmail_pass_input = st.sidebar.text_input("Gmail App Password", type="password", value=secrets_gmail_pass or "")
+    alert_recipient_input = st.sidebar.text_input("Recipient Email", value=secrets_alert_recipient or "")
+else:
+    gmail_id_input = gmail_pass_input = alert_recipient_input = ""
 
 page = st.session_state.forced_page if st.session_state.forced_page else sidebar_page
 
 # ----------------------------
-# Helper functions
+# Helper functions: email, export, pdf, charts
 # ----------------------------
+def send_gmail_alert(product, current_stock, reorder_point, avg_demand):
+    """
+    Sends a low-stock alert via Gmail SMTP.
+    Uses st.secrets.gmail_id/gmail_pass/alert_recipient if present; else uses sidebar inputs.
+    IMPORTANT: Use an App Password (16-char) for gmail_pass when 2FA is enabled.
+    """
+    if not enable_email:
+        return False, "Email alerts disabled"
+
+    # Resolve credentials: secrets preferred, then sidebar inputs
+    gmail_id = secrets_gmail_id or gmail_id_input
+    gmail_pass = secrets_gmail_pass or gmail_pass_input
+    recipient = secrets_alert_recipient or alert_recipient_input
+
+    if not (gmail_id and gmail_pass and recipient):
+        return False, "SMTP fields missing (set secrets or enter in sidebar)"
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"Low Stock Alert - {product}"
+        msg["From"] = gmail_id
+        msg["To"] = recipient
+        msg.set_content(
+            f"⚠️ LOW STOCK ALERT\n\n"
+            f"Product: {product}\n"
+            f"Current stock: {current_stock}\n"
+            f"Reorder point: {int(reorder_point)}\n"
+            f"Avg daily demand (forecast): {avg_demand:.2f}\n\n"
+            f"Sent by Smart Shopkeeper Assistant."
+        )
+
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
+        server.ehlo()
+        server.starttls()
+        server.login(gmail_id, gmail_pass)
+        server.send_message(msg)
+        server.quit()
+        return True, "Email sent"
+    except Exception as e:
+        # return a readable error; in Streamlit logs full traceback is available if user expands
+        return False, str(e)
+
 def excel_bytes_multi(all_data, summary_df):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -134,8 +156,40 @@ def pdf_quick_report(history_df, forecast_df, product_name):
     buf.seek(0)
     return buf
 
+# plotting helpers (Plotly optional)
+def render_line_chart(df, x, y, title=None, use_container_width=True):
+    if px_available:
+        fig = px.line(df, x=x, y=y, title=title)
+        st.plotly_chart(fig, use_container_width=use_container_width)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.plot(df[x], df[y], marker="o")
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
+        ax.grid(True)
+        st.pyplot(fig)
+        plt.close(fig)
+
+def render_bar_chart(df, x, y, title=None, use_container_width=True):
+    if px_available:
+        fig = px.bar(df, x=x, y=y, title=title)
+        st.plotly_chart(fig, use_container_width=use_container_width)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.bar(df[x].astype(str), df[y])
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
+        ax.grid(True, axis='y')
+        plt.xticks(rotation=45, ha='right')
+        st.pyplot(fig)
+        plt.close(fig)
+
 def naive_forecast(history_df, days_ahead):
-    """Fallback when Prophet is not available or data is too small."""
+    """Fallback when Prophet isn't available or data is tiny."""
     h = history_df.copy()
     if h.empty:
         future_dates = pd.date_range(start=pd.Timestamp.today(), periods=days_ahead, freq='D')
@@ -162,16 +216,8 @@ def colored_badge(text, color):
 # Product Emojis
 # ----------------------------
 product_emojis = {
-    "Milk": "🥛",
-    "Bread": "🍞",
-    "Biscuit": "🍪",
-    "Chocolate": "🍫",
-    "Juice": "🧃",
-    "Soap": "🧼",
-    "Oil": "🛢️",
-    "Rice": "🍚",
-    "Salt": "🧂",
-    "Tissue": "🧻",
+    "Milk": "🥛", "Bread": "🍞", "Biscuit": "🍪", "Chocolate": "🍫", "Juice": "🧃",
+    "Soap": "🧼", "Oil": "🛢️", "Rice": "🍚", "Salt": "🧂", "Tissue": "🧻",
 }
 
 # ----------------------------
@@ -251,9 +297,7 @@ if page == "Forecasting":
     dfp["ds"] = pd.to_datetime(dfp["ds"])
     dfp["y"] = pd.to_numeric(dfp["y"], errors="coerce").fillna(0)
 
-    # ------------------------------------------------------------
     # Decide: Prophet or fallback?
-    # ------------------------------------------------------------
     if USE_PROPHET and dfp["y"].count() >= 2:
         try:
             model = Prophet(weekly_seasonality=True)
@@ -270,6 +314,8 @@ if page == "Forecasting":
             )
         except Exception as e:
             st.warning("Prophet failed — using fallback forecast instead.")
+            with st.expander("Prophet error (traceback)"):
+                st.text(traceback.format_exc())
             forecast_display = naive_forecast(prod_hist, int(forecast_days))
     else:
         if not USE_PROPHET:
@@ -281,7 +327,7 @@ if page == "Forecasting":
     st.subheader(f"{forecast_days}-day Forecast")
     st.dataframe(forecast_display)
 
-    # Chart (uses plotly if available, else matplotlib)
+    # Chart
     combined = pd.concat([
         prod_hist.rename(columns={"Date": "Date", "Quantity": "Sales"})[["Date", "Sales"]],
         forecast_display.rename(columns={"Date": "Date", "Predicted Sales": "Sales"})[["Date", "Sales"]],
@@ -289,7 +335,7 @@ if page == "Forecasting":
     render_line_chart(combined, x="Date", y="Sales", title=f"History + Forecast: {selected_product}")
 
     # Inventory suggestion
-    avg_demand = float(forecast_display["Predicted Sales"].mean())
+    avg_demand = float(forecast_display["Predicted Sales"].mean()) if len(forecast_display) > 0 else 0.0
     reorder_point = avg_demand * lead_time_days
 
     c1, c2 = st.columns(2)
@@ -309,6 +355,14 @@ if page == "Forecasting":
 
     if current_stock < reorder_point:
         st.error(f"⚠️ LOW STOCK: {current_stock} < {int(reorder_point)}")
+        # Offer to send Gmail alert if enabled
+        if enable_email:
+            if st.button("📧 Send Gmail Alert"):
+                success, msg = send_gmail_alert(selected_product, current_stock, reorder_point, avg_demand)
+                if success:
+                    st.success("📧 Gmail alert sent.")
+                else:
+                    st.error(f"Email failed: {msg}")
     else:
         st.success("Stock is OK ✔")
 
@@ -318,22 +372,13 @@ if page == "Forecasting":
         data[data["Product"] == selected_product],
         forecast_display
     )
-    st.download_button(
-        "📥 Download Forecast Excel",
-        data=excel_data,
-        file_name=f"{selected_product}_forecast.xlsx"
-    )
-
+    st.download_button("📥 Download Forecast Excel", data=excel_data, file_name=f"{selected_product}_forecast.xlsx")
     pdf_data = pdf_quick_report(
         prod_hist.rename(columns={"Date": "Date", "Quantity": "Quantity"}).tail(30),
         forecast_display,
         selected_product
     )
-    st.download_button(
-        "📄 Download PDF Report",
-        data=pdf_data,
-        file_name=f"{selected_product}_report.pdf"
-    )
+    st.download_button("📄 Download PDF Report", data=pdf_data, file_name=f"{selected_product}_report.pdf")
 
 # ----------------------------
 # PAGE: Inventory Dashboard
@@ -360,18 +405,15 @@ if page == "Inventory Dashboard":
     )
 
     summary = pd.merge(total_by_product, recent, on="Product", how="left").fillna(0)
-    # unify column names for safety: recent sum may be named "Quantity_y" if merged; normalize below
+    # normalize columns
     if "Quantity_y" in summary.columns:
         summary = summary.rename(columns={"Quantity_x": "TotalSold", "Quantity_y": "SoldRecent"})
     else:
-        # make explicit TotalSold, SoldRecent
         summary = summary.rename(columns={"Quantity": "TotalSold"})
         if "SoldRecent" not in summary.columns:
-            # compute SoldRecent from 'recent' merge
             recent_map = recent.set_index("Product")["Quantity"].to_dict()
             summary["SoldRecent"] = summary["Product"].map(recent_map).fillna(0)
 
-    # ensure numeric columns
     summary["SoldRecent"] = pd.to_numeric(summary["SoldRecent"], errors="coerce").fillna(0)
     summary["AvgDailyRecent"] = summary["SoldRecent"] / (window_days if window_days > 0 else 1)
     summary["CurrentStock"] = summary["Product"].apply(lambda p: st.session_state.get(f"stock_{p}", 0))
@@ -408,12 +450,10 @@ if page == "Inventory Dashboard":
     monthly = data.copy()
     monthly["Month"] = monthly["Date"].dt.to_period("M").astype(str)
     monthly_agg = monthly.groupby(["Month", "Product"])["Quantity"].sum().reset_index()
-    # plot grouped bar chart - prefer plotly; fallback to matplotlib stacked/grouped may be messy but attempt simple grouped
     if px_available:
         fig_month = px.bar(monthly_agg, x="Month", y="Quantity", color="Product", title="Monthly Sales", barmode="group")
         st.plotly_chart(fig_month, use_container_width=True)
     else:
-        # simple visualization: pivot for matplotlib
         try:
             pivot = monthly_agg.pivot(index="Month", columns="Product", values="Quantity").fillna(0)
             fig, ax = plt.subplots(figsize=(10, 5))
@@ -451,6 +491,7 @@ if page == "Help":
     • Add daily sales in **Sales Entry**  
     • Get demand forecast in **Forecasting**  
     • View stock health in **Inventory Dashboard**  
+    • To enable Gmail alerts: set `gmail_id`, `gmail_pass` (App Password), and `alert_recipient` in Streamlit Secrets or enter them in the sidebar.
     """)
 
 # ----------------------------
